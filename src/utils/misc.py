@@ -25,7 +25,7 @@ import torch.multiprocessing as mp
 import torchvision.transforms as transforms
 import shutil
 import numpy as np
-import seaborn as sns
+#import seaborn as sns
 import matplotlib.pyplot as plt
 
 import utils.sample as sample
@@ -447,7 +447,7 @@ def plot_spectrum_image(real_spectrum, fake_spectrum, directory, logger, logging
     if logging:
         logger.info("Save image to {}".format(save_path))
 
-
+'''
 def plot_tsne_scatter_plot(df, tsne_results, flag, directory, logger, logging=True):
     if logger is None:
         logging = False
@@ -473,7 +473,7 @@ def plot_tsne_scatter_plot(df, tsne_results, flag, directory, logger, logging=Tr
     plt.savefig(save_path)
     if logging:
         logger.info("Save image to {path}".format(path=save_path))
-
+'''
 
 def save_images_png(data_loader, generator, discriminator, is_generate, num_images, y_sampler, batch_size, z_prior,
                     truncation_factor, z_dim, num_classes, LOSS, OPTIMIZATION, RUN, MODEL, is_stylegan, generator_mapping,
