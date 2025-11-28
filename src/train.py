@@ -4,6 +4,8 @@ import torch.nn as nn
 import os
 import sys
 from tqdm import tqdm
+import time
+from torch.amp import GradScaler, autocast
 
 # utils 경로 추가 (ops.py, misc.py가 src/utils에 있으므로)
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
@@ -29,7 +31,7 @@ def load_weight_safe(model, path):
     if os.path.exists(path):
         print(f"Loading weights from {path}...")
         # map_location을 사용하여 CPU/GPU 호환성 확보
-        state_dict = torch.load(path, map_location='cpu')
+        state_dict = torch.load(path, map_location='cpu', weights_only=False)
         
         # 1. StudioGAN 체크포인트의 다양한 키 구조 대응
         if 'state_dict' in state_dict:
@@ -65,6 +67,15 @@ def toggle_grad(model, on, freeze_layers_contain=None):
         else:
             param.requires_grad = on
 
+def remove_attention_layers(model):
+    removed_count = 0
+    for block_list in model.blocks:
+        for i, layer in enumerate(block_list):
+            if "SelfAttention" in layer.__class__.__name__:
+                block_list[i] = nn.Identity()
+                removed_count += 1
+    print(f"Removed {removed_count} Attention layers from {model.__class__.__name__}.")
+
 def train():
     # 1. Dataset
     dataloader, class_names = get_dataloader()
@@ -76,7 +87,7 @@ def train():
     
     G = Generator(
         z_dim=cfg.Z_DIM, g_shared_dim=cfg.G_SHARED_DIM, img_size=cfg.IMG_SIZE,
-        g_conv_dim=cfg.G_CONV_DIM, apply_attn=True, attn_g_loc=[4],
+        g_conv_dim=cfg.G_CONV_DIM, apply_attn=cfg.APPLY_ATTN, attn_g_loc=cfg.ATTN_G_LOC,
         g_cond_mtd="cBN", num_classes=cfg.PRETRAINED_CLASSES,
         g_init='ortho', g_depth=None, mixed_precision=False,
         MODULES=MODULES, MODEL=model_cfg
@@ -84,7 +95,7 @@ def train():
 
     D = Discriminator(
         img_size=cfg.IMG_SIZE, d_conv_dim=cfg.D_CONV_DIM,
-        apply_d_sn=True, apply_attn=True, attn_d_loc=[1],
+        apply_d_sn=True, apply_attn=cfg.APPLY_ATTN, attn_d_loc=cfg.ATTN_D_LOC,
         d_cond_mtd="AC", aux_cls_type="N/A", d_embed_dim=None, normalize_d_embed=False,
         num_classes=cfg.PRETRAINED_CLASSES,
         d_init='ortho', d_depth=None, mixed_precision=False,
@@ -122,9 +133,12 @@ def train():
     toggle_grad(G, False, freeze_layers_contain=['shared'])
     toggle_grad(D, False, freeze_layers_contain=['linear2'])
 
+    scaler = GradScaler('cuda')
     # 6. Training Loop
     print("Start Training...")
-    step = 0
+    
+    global_step = 0
+
     for epoch in range(cfg.EPOCHS):
         # Warm-up이 끝나면 Backbone 학습 재개
         if epoch == warmup_epochs:
@@ -135,6 +149,8 @@ def train():
         # tqdm으로 dataloader를 감싸서 프로그레스 바 생성
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS}")
 
+        g_loss_val = 0.0
+
         for real_imgs, labels in loop:
             real_imgs, labels = real_imgs.to(cfg.DEVICE), labels.to(cfg.DEVICE)
             batch_size = real_imgs.size(0)
@@ -144,24 +160,38 @@ def train():
             z = torch.randn(batch_size, cfg.Z_DIM).to(cfg.DEVICE)
             fake_labels = torch.randint(0, cfg.NUM_CLASSES, (batch_size,)).to(cfg.DEVICE)
             
-            fake_imgs = G(z, fake_labels)
-            
-            d_out_real = D(real_imgs, labels)
-            d_out_fake = D(fake_imgs.detach(), fake_labels)
-            
-            d_loss = d_loss_hinge_acgan(d_out_real['adv_output'], d_out_fake['adv_output'],
+            with autocast(device_type='cuda', dtype=torch.float16):
+                fake_imgs = G(z, fake_labels)
+                d_out_real = D(real_imgs, labels)
+                d_out_fake = D(fake_imgs.detach(), fake_labels)
+                
+                d_loss = d_loss_hinge_acgan(d_out_real['adv_output'], d_out_fake['adv_output'],
                                         d_out_real['cls_output'], d_out_fake['cls_output'], labels)
-            d_loss.backward()
-            optimizer_D.step()
+                
+            scaler.scale(d_loss).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+            #d_loss.backward()
+            #optimizer_D.step()
 
             # --- Train G ---
-            optimizer_G.zero_grad()
+            if global_step % cfg.D_STEPS == 0:
+                optimizer_G.zero_grad()
+                
+                with autocast(device_type='cuda', dtype=torch.float16):
+                    fake_imgs_g = G(z, fake_labels)
+                    d_out_gen = D(fake_imgs_g, fake_labels)
+                    g_loss = g_loss_hinge_acgan(d_out_gen['adv_output'], d_out_gen['cls_output'], fake_labels)
+                
+                scaler.scale(g_loss).backward()
+                scaler.step(optimizer_G)
+                scaler.update()
+
+                g_loss_val = g_loss.item()
             
-            fake_imgs_g = G(z, fake_labels)
-            d_out_gen = D(fake_imgs_g, fake_labels)
-            g_loss = g_loss_hinge_acgan(d_out_gen['adv_output'], d_out_gen['cls_output'], fake_labels)
-            g_loss.backward()
-            optimizer_G.step()
+            global_step += 1
+            #g_loss.backward()
+            #optimizer_G.step()
 
             # tqdm의 postfix로 실시간 Loss 표시
             loop.set_postfix(d_loss=f"{d_loss.item():.4f}", g_loss=f"{g_loss.item():.4f}")
@@ -171,12 +201,12 @@ def train():
             sample_z = torch.randn(cfg.NUM_CLASSES * 4, cfg.Z_DIM).to(cfg.DEVICE)
             sample_y = torch.arange(cfg.NUM_CLASSES).repeat_interleave(4).to(cfg.DEVICE)
             sample_imgs = G(sample_z, sample_y)
-            save_image((sample_imgs + 1) / 2, os.path.join(cfg.SAMPLE_DIR, f'epoch_{epoch}.png'), nrow=4)
+            save_image((sample_imgs + 1) / 2, os.path.join(cfg.SAMPLE_DIR, f'epoch_{epoch+1}.png'), nrow=4)
             
             # 체크포인트 저장
-            if epoch % cfg.CHECKPOINT_INTERVAL == 0:
-                 torch.save(G.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{epoch}.pth'))
-                 torch.save(D.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{epoch}.pth'))
+            if (epoch+1) % cfg.CHECKPOINT_INTERVAL == 0:
+                 torch.save(G.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{epoch+1}.pth'))
+                 torch.save(D.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{epoch+1}.pth'))
 
 if __name__ == "__main__":
     os.makedirs(cfg.SAMPLE_DIR, exist_ok=True)
