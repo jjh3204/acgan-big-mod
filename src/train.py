@@ -77,6 +77,8 @@ def remove_attention_layers(model):
     print(f"Removed {removed_count} Attention layers from {model.__class__.__name__}.")
 
 def train():
+    # 예: RESUME_EPOCH = 50 이면 'G_epoch_50.pth'를 로드하고 51에폭부터 시작
+    RESUME_EPOCH = 0
     # 1. Dataset
     dataloader, class_names = get_dataloader()
     print(f"Target Classes ({cfg.NUM_CLASSES}): {class_names}")
@@ -85,10 +87,12 @@ def train():
     print("Initializing models...")
     model_cfg = ModelConfigStub()
     
+    init_classes = cfg.NUM_CLASSES if RESUME_EPOCH > 0 else cfg.PRETRAINED_CLASSES
+    
     G = Generator(
         z_dim=cfg.Z_DIM, g_shared_dim=cfg.G_SHARED_DIM, img_size=cfg.IMG_SIZE,
         g_conv_dim=cfg.G_CONV_DIM, apply_attn=cfg.APPLY_ATTN, attn_g_loc=cfg.ATTN_G_LOC,
-        g_cond_mtd="cBN", num_classes=cfg.PRETRAINED_CLASSES,
+        g_cond_mtd="cBN", num_classes=init_classes,
         g_init='ortho', g_depth=None, mixed_precision=False,
         MODULES=MODULES, MODEL=model_cfg
     ).to(cfg.DEVICE)
@@ -97,29 +101,43 @@ def train():
         img_size=cfg.IMG_SIZE, d_conv_dim=cfg.D_CONV_DIM,
         apply_d_sn=True, apply_attn=cfg.APPLY_ATTN, attn_d_loc=cfg.ATTN_D_LOC,
         d_cond_mtd="AC", aux_cls_type="N/A", d_embed_dim=None, normalize_d_embed=False,
-        num_classes=cfg.PRETRAINED_CLASSES,
+        num_classes=init_classes,
         d_init='ortho', d_depth=None, mixed_precision=False,
         MODULES=MODULES, MODEL=model_cfg
     ).to(cfg.DEVICE)
 
-    # 3. Load Separated Weights
-    load_weight_safe(G, cfg.PRETRAINED_G_PATH)
-    load_weight_safe(D, cfg.PRETRAINED_D_PATH)
+    # 3. Load Weights & Surgery logic
+    if RESUME_EPOCH > 0:
+        # [재개 모드] 저장된 내 체크포인트 로드
+        print(f"Resuming training from Epoch {RESUME_EPOCH}...")
+        g_path = os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{RESUME_EPOCH}.pth')
+        d_path = os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{RESUME_EPOCH}.pth')
+        
+        if os.path.exists(g_path) and os.path.exists(d_path):
+            G.load_state_dict(torch.load(g_path))
+            D.load_state_dict(torch.load(d_path))
+            print("Checkpoint loaded successfully!")
+        else:
+            raise FileNotFoundError(f"Checkpoints not found: {g_path} or {d_path}")
+            
+        # 재개 모드에서는 이미 모델 구조가 3개 클래스에 맞춰져 있으므로 Surgery 불필요
+    else:
+        # [전이 학습 모드] ImageNet 가중치 로드 -> 모델 수술
+        load_weight_safe(G, cfg.PRETRAINED_G_PATH)
+        load_weight_safe(D, cfg.PRETRAINED_D_PATH)
 
-    # 4. Model Surgery (1000 -> 3 classes)
-    print("Modifying layers for 3 classes...")
-    
-    # [G] Shared Embedding 교체
-    # ops.embedding 사용
-    G.shared = ops.embedding(cfg.NUM_CLASSES, cfg.G_SHARED_DIM).to(cfg.DEVICE)
-    G.num_classes = cfg.NUM_CLASSES
-    
-    # [D] Linear Layer 교체 (ACGAN)
-    # D.linear2 (aux classifier) 교체. big_resnet 구현상 d_cond_mtd="AC"일 때 linear2 사용
-    in_features = D.linear2.in_features
-    # ops.snlinear 사용 (Spectral Norm 적용)
-    D.linear2 = ops.snlinear(in_features, cfg.NUM_CLASSES, bias=False).to(cfg.DEVICE)
-    D.num_classes = cfg.NUM_CLASSES
+        print("Modifying layers for 3 classes...")
+        # [G] Shared Embedding 교체
+        # ops.embedding 사용
+        G.shared = ops.embedding(cfg.NUM_CLASSES, cfg.G_SHARED_DIM).to(cfg.DEVICE)
+        G.num_classes = cfg.NUM_CLASSES
+        
+        # [D] Linear Layer 교체 (ACGAN)
+        # D.linear2 (aux classifier) 교체. big_resnet 구현상 d_cond_mtd="AC"일 때 linear2 사용
+        in_features = D.linear2.in_features
+        # ops.snlinear 사용 (Spectral Norm 적용)
+        D.linear2 = ops.snlinear(in_features, cfg.NUM_CLASSES, bias=False).to(cfg.DEVICE)
+        D.num_classes = cfg.NUM_CLASSES
 
     # 5. Optimizers
     optimizer_G = optim.Adam(G.parameters(), lr=cfg.G_LR, betas=(cfg.BETA1, cfg.BETA2))
@@ -127,11 +145,15 @@ def train():
 
     # [수정됨] Warm-up 설정: 처음 5 epoch 동안은 Backbone을 얼림
     warmup_epochs = 5
-    print(f"Freezing backbone for first {warmup_epochs} epochs...")
-
-    # G의 shared, D의 linear2만 학습하고 나머지는 False
-    toggle_grad(G, False, freeze_layers_contain=['shared'])
-    toggle_grad(D, False, freeze_layers_contain=['linear2'])
+    if RESUME_EPOCH < warmup_epochs:
+        print(f"Freezing backbone for first {warmup_epochs} epochs...")
+        # G의 shared, D의 linear2만 학습하고 나머지는 False
+        toggle_grad(G, False, freeze_layers_contain=['shared'])
+        toggle_grad(D, False, freeze_layers_contain=['linear2'])
+    else:
+        print("Resuming after warm-up period. All layers are trainable.")
+        toggle_grad(G, True)
+        toggle_grad(D, True)
 
     scaler = GradScaler('cuda')
     # 6. Training Loop
@@ -194,7 +216,7 @@ def train():
             #optimizer_G.step()
 
             # tqdm의 postfix로 실시간 Loss 표시
-            loop.set_postfix(d_loss=f"{d_loss.item():.4f}", g_loss=f"{g_loss.item():.4f}")
+            loop.set_postfix(d_loss=f"{d_loss.item():.4f}", g_loss=f"{g_loss_val:.4f}")
 
         # Save Sample
         with torch.no_grad():
