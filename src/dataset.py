@@ -12,6 +12,7 @@ def get_dataloader():
     # GAN은 보통 Generator의 마지막이 Tanh이므로 이미지를 -1 ~ 1로 정규화합니다.
     transform = transforms.Compose([
         transforms.Resize((cfg.IMG_SIZE, cfg.IMG_SIZE)),  # 128x128로 리사이즈
+        transforms.RandomHorizontalFlip(),                # 데이터 증강 (좌우 반전)
         transforms.ToTensor(),                            # 0~1 범위의 Tensor로 변환
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # (0~1) -> (-1~1) 정규화
     ])
