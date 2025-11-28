@@ -2,10 +2,14 @@ import torch
 
 class Config:
     # 데이터 경로
-    DATA_PATH = './data/fruit_dataset'
+    DATA_PATH = './data/fruit_dataset/train'
     
     PRETRAINED_G_PATH = './results/checkpoints/model=G-best-weights-step=200000.pth'
     PRETRAINED_D_PATH = './results/checkpoints/model=D-best-weights-step=200000.pth'
+
+    APPLY_ATTN = True          # False로 설정하여 어텐션 끄기
+    ATTN_G_LOC = [4]
+    ATTN_D_LOC = [1]
 
     # Model Settings (YAML 기반)
     IMG_SIZE = 128
@@ -25,7 +29,7 @@ class Config:
     BETA1 = 0.0
     BETA2 = 0.999
 
-    EPOCHS = 500               # 총 학습 에폭 수
+    EPOCHS = 50               # 총 학습 에폭 수
     NUM_WORKERS = 4            # DataLoader의 num_workers (CPU 코어 수에 맞게 조절)
     D_STEPS = 2                # Generator 1회 업데이트 당 Discriminator 업데이트 횟수
 
