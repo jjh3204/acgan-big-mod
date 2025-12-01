@@ -81,22 +81,31 @@ def get_features_and_probs(model, data_source, is_generator=False, num_samples=N
     probs = [] # IS 계산을 위한 확률값 저장소
     
     if is_generator:
-        print("Generating Fake Images and extracting outputs...")
-        num_batches = num_samples // cfg.BATCH_SIZE
+        print(f"Generating {num_samples} Fake Images...")
+        num_batches = int(np.ceil(num_samples / cfg.BATCH_SIZE))
         iterator = tqdm(range(num_batches), desc="Fake Outputs")
     else:
         print("Extracting outputs from Real Images...")
         iterator = tqdm(data_source, desc="Real Outputs")
 
     with torch.no_grad():
+        generated_count = 0
         for item in iterator:
             if is_generator:
-                z = torch.randn(cfg.BATCH_SIZE, cfg.Z_DIM).to(cfg.DEVICE)
-                labels = torch.randint(0, cfg.NUM_CLASSES, (cfg.BATCH_SIZE,)).to(cfg.DEVICE)
+                if generated_count >= num_samples: break # 개수 충족 시 중단
+
+                current_batch_size = cfg.BATCH_SIZE
+                # 마지막 배치 처리
+                if generated_count + current_batch_size > num_samples:
+                    current_batch_size = num_samples - generated_count
+
+                z = torch.randn(current_batch_size, cfg.Z_DIM).to(cfg.DEVICE)
+                labels = torch.randint(0, cfg.NUM_CLASSES, (current_batch_size,)).to(cfg.DEVICE)
                 with autocast(device_type='cuda', dtype=torch.float16):
                     imgs = data_source(z, labels)
                     imgs = (imgs + 1) / 2 # (-1~1) -> (0~1)
                     imgs = torch.clamp(imgs, 0, 1)
+                generated_count += current_batch_size
             else:
                 imgs, _ = item
                 imgs = imgs.to(cfg.DEVICE)
@@ -115,6 +124,12 @@ def get_features_and_probs(model, data_source, is_generator=False, num_samples=N
 
     features = np.concatenate(features, axis=0)
     probs = torch.cat(probs, dim=0) # Tensor로 합치기
+
+    # Real 이미지의 경우 데이터가 많으면 자르기 (가짜와 개수 맞춤)
+    if num_samples is not None and len(features) > num_samples:
+        features = features[:num_samples]
+        probs = probs[:num_samples]
+
     return features, probs
 
 def calculate_stats(activations):
@@ -124,6 +139,11 @@ def calculate_stats(activations):
     return mu, sigma
 
 def evaluate():
+    # 0. 모델 경로 확인
+    if not os.path.exists(cfg.CHECKPOINT_DIR):
+        print(f"Checkpoint directory not found: {cfg.CHECKPOINT_DIR}")
+        return
+    
     # 1. 평가할 모델 경로 (가장 최근에 저장된 모델 또는 Best 모델 지정)
     # 예: checkpoints 폴더에서 가장 마지막 파일 자동 선택
     ckpt_files = sorted([f for f in os.listdir(cfg.CHECKPOINT_DIR) if f.startswith('G_epoch')])
@@ -132,27 +152,42 @@ def evaluate():
         return
     target_ckpt = os.path.join(cfg.CHECKPOINT_DIR, ckpt_files[-1]) # 가장 최근 파일
     # target_ckpt = "./results/checkpoints/G_epoch_100.pth" # 특정 파일 지정 가능
+    print(f"Target Checkpoint: {target_ckpt}")
 
     # 2. Inception 모델 로드
     print("Loading InceptionV3 Model...")
     inception = InceptionV3(resize_input=True, normalize_input=True).to(cfg.DEVICE)
     inception.eval()
 
-    # 3. 진짜 이미지 데이터 통계 계산 (mu1, sigma1)
+    # 3. 진짜 이미지 데이터 통계 계산 (FID용)
     dataloader, _ = get_dataloader()
     real_feats, _ = get_features_and_probs(inception, dataloader, is_generator=False)
     mu1, sigma1 = calculate_stats(real_feats)
+    print(f"Real Statistics Calculated: {real_feats.shape}")
 
     # 4. Fake Data (FID + IS용)
     G = load_generator(target_ckpt)
     fake_feats, fake_probs = get_features_and_probs(inception, G, is_generator=True, num_samples=len(real_feats))
     mu2, sigma2 = calculate_stats(fake_feats)
+    print(f"Fake Statistics Calculated: {fake_feats.shape}")
 
     # 5. 메트릭 계산
     print("Calculating Metrics...")
 
-    fid_score = frechet_inception_distance(mu1, sigma1, mu2, sigma2)
-    is_score, is_std = calculate_kl_div(fake_probs, splits=10)
+    try:
+        fid_score = frechet_inception_distance(mu1, sigma1, mu2, sigma2)
+    except Exception as e:
+        print(f"FID Calculation Error: {e}")
+        fid_score = -1.0
+        
+    try:
+        # 데이터가 너무 적으면 splits를 줄여야 함
+        num_samples = len(fake_probs)
+        splits = 10 if num_samples >= 100 else 1
+        is_score, is_std = calculate_kl_div(fake_probs, splits=splits)
+    except Exception as e:
+        print(f"IS Calculation Error: {e}")
+        is_score, is_std = -1.0, 0.0
 
     print("=" * 30)
     print(f"Model Path: {os.path.basename(target_ckpt)}")
