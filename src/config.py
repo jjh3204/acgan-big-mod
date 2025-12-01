@@ -41,4 +41,6 @@ class Config:
     SAMPLE_DIR = './results/samples'
     CHECKPOINT_DIR = './results/checkpoints'
 
+    DIFF_AUGMENT_POLICY = "color,translation,cutout"
+
 cfg = Config()

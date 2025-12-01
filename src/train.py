@@ -17,6 +17,7 @@ from components import MODULES
 import utils.ops as ops
 from big_resnet import Generator, Discriminator
 from torchvision.utils import save_image
+from utils.diff_augment import apply_diffaug
 
 # Dummy Model Config for Initialization
 class ModelConfigStub:
@@ -161,7 +162,7 @@ def train():
     
     global_step = 0
 
-    for epoch in range(cfg.EPOCHS):
+    for epoch in range(RESUME_EPOCH, cfg.EPOCHS):
         # Warm-up이 끝나면 Backbone 학습 재개
         if epoch == warmup_epochs:
             print("Unfreezing all layers! Start fine-tuning backbone.")
@@ -184,9 +185,17 @@ def train():
             
             with autocast(device_type='cuda', dtype=torch.float16):
                 fake_imgs = G(z, fake_labels)
+                # [⭐️핵심 수정] 판별자에 넣기 전, 둘 다 증강 적용!
+                real_imgs_aug = apply_diffaug(real_imgs, cfg.DIFF_AUGMENT_POLICY)
+                fake_imgs_aug = apply_diffaug(fake_imgs, cfg.DIFF_AUGMENT_POLICY)
+                
+                # 증강된 이미지를 D에 입력
+                d_out_real = D(real_imgs_aug, labels)
+                d_out_fake = D(fake_imgs_aug.detach(), fake_labels)
+                '''
                 d_out_real = D(real_imgs, labels)
                 d_out_fake = D(fake_imgs.detach(), fake_labels)
-                
+                '''
                 d_loss = d_loss_hinge_acgan(d_out_real['adv_output'], d_out_fake['adv_output'],
                                         d_out_real['cls_output'], d_out_fake['cls_output'], labels)
                 
@@ -201,8 +210,13 @@ def train():
                 optimizer_G.zero_grad()
                 
                 with autocast(device_type='cuda', dtype=torch.float16):
+                    # [⭐️핵심 수정] G 학습 때도 증강된 이미지로 속임수를 써야 함
                     fake_imgs_g = G(z, fake_labels)
+                    fake_imgs_g_aug = apply_diffaug(fake_imgs_g, cfg.DIFF_AUGMENT_POLICY)
+                    d_out_gen = D(fake_imgs_g_aug, fake_labels)
+                    '''
                     d_out_gen = D(fake_imgs_g, fake_labels)
+                    '''
                     g_loss = g_loss_hinge_acgan(d_out_gen['adv_output'], d_out_gen['cls_output'], fake_labels)
                 
                 scaler.scale(g_loss).backward()
