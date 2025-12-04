@@ -112,6 +112,7 @@ def get_features_and_probs(model, data_source, is_generator=False, num_samples=N
                 imgs = (imgs + 1) / 2 
                 imgs = torch.clamp(imgs, 0, 1)
 
+            imgs = imgs.float()
             # Inception 통과 (features: 2048차원, logits: 1008차원)
             feat, logits = model(imgs)
             
