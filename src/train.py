@@ -208,7 +208,6 @@ def train():
 
         # tqdm으로 dataloader를 감싸서 프로그레스 바 생성
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS}")
-
         g_loss_val = 0.0
 
         for real_imgs, labels in loop:
@@ -222,11 +221,10 @@ def train():
             
             with autocast(device_type='cuda', dtype=torch.float16):
                 fake_imgs = G(z, fake_labels)
-                # [⭐️핵심 수정] 판별자에 넣기 전, 둘 다 증강 적용!
+                # [DiffAugment] D 학습 시 Real/Fake 모두 증강
                 real_imgs_aug = apply_diffaug(real_imgs, cfg.DIFF_AUGMENT_POLICY)
                 fake_imgs_aug = apply_diffaug(fake_imgs, cfg.DIFF_AUGMENT_POLICY)
                 
-                # 증강된 이미지를 D에 입력
                 d_out_real = D(real_imgs_aug, labels)
                 d_out_fake = D(fake_imgs_aug.detach(), fake_labels)
                 '''
@@ -247,18 +245,21 @@ def train():
                 optimizer_G.zero_grad()
                 
                 with autocast(device_type='cuda', dtype=torch.float16):
-                    # [⭐️핵심 수정] G 학습 때도 증강된 이미지로 속임수를 써야 함
                     fake_imgs_g = G(z, fake_labels)
+                    # [DiffAugment] G 학습 시에도 증강 적용
                     fake_imgs_g_aug = apply_diffaug(fake_imgs_g, cfg.DIFF_AUGMENT_POLICY)
-                    d_out_gen = D(fake_imgs_g_aug, fake_labels)
                     '''
                     d_out_gen = D(fake_imgs_g, fake_labels)
                     '''
+                    d_out_gen = D(fake_imgs_g_aug, fake_labels)
                     g_loss = g_loss_hinge_acgan(d_out_gen['adv_output'], d_out_gen['cls_output'], fake_labels)
                 
                 scaler.scale(g_loss).backward()
                 scaler.step(optimizer_G)
                 scaler.update()
+
+                # [EMA Update] G 업데이트 직후 실행
+                update_average(G_ema, G, beta=0.999)
 
                 g_loss_val = g_loss.item()
             
@@ -273,13 +274,21 @@ def train():
         with torch.no_grad():
             sample_z = torch.randn(cfg.NUM_CLASSES * 4, cfg.Z_DIM).to(cfg.DEVICE)
             sample_y = torch.arange(cfg.NUM_CLASSES).repeat_interleave(4).to(cfg.DEVICE)
-            sample_imgs = G(sample_z, sample_y)
-            save_image((sample_imgs + 1) / 2, os.path.join(cfg.SAMPLE_DIR, f'epoch_{epoch+1}.png'), nrow=4)
+
+            # Raw 저장
+            sample_imgs_raw = G(sample_z, sample_y)
+            save_image((sample_imgs_raw + 1) / 2, os.path.join(cfg.SAMPLE_DIR, f'epoch_{epoch+1}_raw.png'), nrow=4)
             
+            # EMA 저장 (훨씬 품질이 좋음)
+            sample_imgs_ema = G_ema(sample_z, sample_y)
+            save_image((sample_imgs_ema + 1) / 2, os.path.join(cfg.SAMPLE_DIR, f'epoch_{epoch+1}_ema.png'), nrow=4)
+
             # 체크포인트 저장
             if (epoch+1) % cfg.CHECKPOINT_INTERVAL == 0:
                  torch.save(G.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{epoch+1}.pth'))
                  torch.save(D.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{epoch+1}.pth'))
+                # EMA 모델 저장 (배포용)
+                 torch.save(G_ema.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, f'G_ema_epoch_{epoch+1}.pth'))
 
 if __name__ == "__main__":
     os.makedirs(cfg.SAMPLE_DIR, exist_ok=True)
