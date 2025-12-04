@@ -19,6 +19,21 @@ from big_resnet import Generator, Discriminator
 from torchvision.utils import save_image
 from utils.diff_augment import apply_diffaug
 
+# EMA 업데이트 유틸리티 함수
+def update_average(model_ema, model_tgt, beta=0.999):
+    with torch.no_grad():
+        param_dict_tgt = dict(model_tgt.named_parameters())
+        for name, param_ema in model_ema.named_parameters():
+            if name in param_dict_tgt:
+                param_tgt = param_dict_tgt[name]
+                param_ema.copy_(beta * param_ema + (1. - beta) * param_tgt)
+        
+        buffer_dict_tgt = dict(model_tgt.named_buffers())
+        for name, buffer_ema in model_ema.named_buffers():
+            if name in buffer_dict_tgt:
+                buffer_tgt = buffer_dict_tgt[name]
+                buffer_ema.copy_(buffer_tgt)
+
 # Dummy Model Config for Initialization
 class ModelConfigStub:
     def __init__(self):
@@ -107,10 +122,16 @@ def train():
         MODULES=MODULES, MODEL=model_cfg
     ).to(cfg.DEVICE)
 
+    # 2. EMA 모델 초기화 (G와 동일한 구조)
+    G_ema = copy.deepcopy(G)
+    for p in G_ema.parameters():
+        p.requires_grad_(False)
+
     # 3. Load Weights & Surgery logic
     if RESUME_EPOCH > 0:
         # [재개 모드] 저장된 내 체크포인트 로드
         print(f"Resuming training from Epoch {RESUME_EPOCH}...")
+        '''
         g_path = os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{RESUME_EPOCH}.pth')
         d_path = os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{RESUME_EPOCH}.pth')
         
@@ -120,6 +141,16 @@ def train():
             print("Checkpoint loaded successfully!")
         else:
             raise FileNotFoundError(f"Checkpoints not found: {g_path} or {d_path}")
+        '''
+        G.load_state_dict(torch.load(os.path.join(cfg.CHECKPOINT_DIR, f'G_epoch_{RESUME_EPOCH}.pth'))['model'])
+        D.load_state_dict(torch.load(os.path.join(cfg.CHECKPOINT_DIR, f'D_epoch_{RESUME_EPOCH}.pth'))['model'])
+        
+        # EMA 모델 로드 (없으면 G 복사)
+        ema_path = os.path.join(cfg.CHECKPOINT_DIR, f'G_ema_epoch_{RESUME_EPOCH}.pth')
+        if os.path.exists(ema_path):
+            G_ema.load_state_dict(torch.load(ema_path))
+        else:
+            G_ema.load_state_dict(G.state_dict())
             
         # 재개 모드에서는 이미 모델 구조가 3개 클래스에 맞춰져 있으므로 Surgery 불필요
     else:
@@ -140,6 +171,12 @@ def train():
         D.linear2 = ops.snlinear(in_features, cfg.NUM_CLASSES, bias=False).to(cfg.DEVICE)
         D.num_classes = cfg.NUM_CLASSES
 
+        # 수술 후 G의 상태를 G_ema에 동기화
+        G_ema.load_state_dict(G.state_dict())
+        # G_ema도 수술된 레이어 구조를 가져야 하므로 다시 복사하는 게 안전함
+        G_ema.shared = copy.deepcopy(G.shared)
+        G_ema.num_classes = cfg.NUM_CLASSES
+
     # 5. Optimizers
     optimizer_G = optim.Adam(G.parameters(), lr=cfg.G_LR, betas=(cfg.BETA1, cfg.BETA2))
     optimizer_D = optim.Adam(D.parameters(), lr=cfg.D_LR, betas=(cfg.BETA1, cfg.BETA2))
@@ -159,7 +196,7 @@ def train():
     scaler = GradScaler('cuda')
     # 6. Training Loop
     print("Start Training...")
-    
+    print(f"Start Training Loop from Epoch {RESUME_EPOCH + 1}")
     global_step = 0
 
     for epoch in range(RESUME_EPOCH, cfg.EPOCHS):
